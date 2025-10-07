@@ -6,8 +6,6 @@ rewriter = LegalRewriter("legal word.pdf")
 
 # Available models
 MODELS = {
-    "GPT-5 Mini (2025-08-07)": "gpt-5-mini-2025-08-07",
-    "Groq GPT-OSS": "openai/gpt-oss-120b",
     "GPT-5 (2025-08-07)": "gpt-5-2025-08-07"
 }
 

@@ -6,8 +6,10 @@ from openai import OpenAI
 load_dotenv()
 
 class LegalRewriter:
-    def __init__(self, pdf_path, model="gpt-5-mini-2025-08-07"):
-        self.model = model
+    def __init__(self, pdf_path, model="gpt-5"):
+        # Force model name to the customer's requested single option
+        # Only 'gpt-5' will be used; ignore other values passed in.
+        self.model = "gpt-5"
         # Extract vocabulary ONCE and store in memory (preprocessed)
         self.vocab_text = self._extract_vocab(pdf_path)
         # Cache clients to avoid recreation
@@ -37,17 +39,12 @@ class LegalRewriter:
 
     def _get_client(self):
         """Get the appropriate client based on the model, with caching."""
-        is_gpt = self.model.startswith("gpt-")
-        
-        if is_gpt not in self._clients:
-            if is_gpt:
-                # Use OpenAI client for GPT models
-                self._clients[is_gpt] = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-            else:
-                # Use Groq client for other models
-                self._clients[is_gpt] = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=os.getenv("GROQ_API_KEY"))
-        
-        return self._clients[is_gpt]
+        # Always use OpenAI for 'gpt-5'. Cache under a fixed key.
+        cache_key = "openai_gpt5"
+        if cache_key not in self._clients:
+            self._clients[cache_key] = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+        return self._clients[cache_key]
 
     def set_model(self, model):
         """Change the model and update the client."""
