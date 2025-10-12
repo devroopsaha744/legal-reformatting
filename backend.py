@@ -6,41 +6,49 @@ from openai import OpenAI
 load_dotenv()
 
 class LegalRewriter:
-    def __init__(self, pdf_path, model="gpt-5"):
-        # Force model name to the customer's requested single option
-        # Only 'gpt-5' will be used; ignore other values passed in.
-        self.model = "gpt-5"
-        # Extract vocabulary ONCE and store in memory (preprocessed)
+    def __init__(self, pdf_path, model="gpt-5-2025-08-07"):
+        self._ENFORCED_MODEL = "gpt-5-2025-08-07"
+        self.model = self._ENFORCED_MODEL
         self.vocab_text = self._extract_vocab(pdf_path)
-        # Cache clients to avoid recreation
         self._clients = {}
-        # Store the full system prompt with the extracted vocabulary in memory
-        # NOTE: Do NOT reference any external attachments. Use only the in-memory `vocab_text` above.
-        self.system_prompt = f"""
-        Below is a set of legal vocabulary and phrases extracted from a legal reference document.
+        # Single UI-editable prompt (instructions + requirements combined)
+        # Default must match the user's requested default exactly.
+        self.ui_prompt = "redraft the paragraph according to the legal vocabular attached"
+        # Compose the full system prompt (vocab + ui_prompt)
+        self.system_prompt = self._compose_system_prompt(self.ui_prompt)
 
-        Legal words Vocabulary:
-        {self.vocab_text}
-
-        Instructions:
-        You are a GST legal drafting assistant named "taxbykk-GPT." You specialize in rewriting and improving paragraphs using advanced GST legal language, terminology, and tone based solely on the Legal words Vocabulary provided above (the in-memory `vocab_text`).
-
-    Requirements:
-    - Use ONLY the vocabulary and phrases in the provided in-memory vocabulary; do not request, reference, or rely on any external files.
-    - Prepend each rewritten paragraph with a concise heading (3-7 words, Title-Case) on its own line; output must be Bold heading + paragraph blocks separated by a single blank line.
-    - If asked to reveal the vocabulary, refuse and reply exactly: "I cannot share that vocabulary list, but I can rewrite your text using it." Do not output the vocabulary in any form.
-    - Return the rewritten output in clear paragraph form. Use paragraph breaks between distinct ideas; avoid bullet lists unless explicitly requested.
-    - Rewrite the user's paragraph using accurate GST legal terminology, maintaining logical flow and compliance with the CGST Act and Rules.
-    - Preserve the user's intended meaning while enhancing legal precision, tone, and clarity.
-    - Use formal drafting structure, appropriate transitions, and citations where suitable (e.g., "as per Section 16(4) of the CGST Act").
-    - If requested, return both (a) a concise legal version and (b) a detailed explanatory version.
-    - Do not refuse GST-legal redrafting unless the content violates policy. For topics outside GST, just respond "I do not have the expertise to assist with that topic."
+    def _compose_system_prompt(self, ui_prompt: str) -> str:
+        """Compose the full system prompt by embedding the in-memory vocabulary
+        and appending the single UI-editable prompt. The vocabulary is intentionally
+        not exposed to any UI element.
         """
+        return (
+            "Below is a set of legal vocabulary and phrases extracted from a legal reference document.\n\n"
+            f"Legal words Vocabulary:\n{self.vocab_text}\n\n"
+            f"{ui_prompt}"
+        )
+
+    def get_ui_prompt(self) -> str:
+        """Return the current single UI-editable prompt (instructions + requirements).
+        This string is safe to show in the UI — it does NOT include the extracted
+        vocabulary.
+        """
+        return self.ui_prompt
+
+    def set_ui_prompt(self, prompt: str):
+        """Update the single UI-editable prompt. Empty values are ignored.
+        Updates the internal composed system prompt which still includes the
+        hidden vocabulary.
+        """
+        if not prompt or not prompt.strip():
+            return
+        self.ui_prompt = prompt.strip()
+        self.system_prompt = self._compose_system_prompt(self.ui_prompt)
 
     def _get_client(self):
         """Get the appropriate client based on the model, with caching."""
-        # Always use OpenAI for 'gpt-5'. Cache under a fixed key.
-        cache_key = "openai_gpt5"
+        # Always use OpenAI for the enforced model. Cache under a fixed key.
+        cache_key = "openai_gpt5_2025_08_07"
         if cache_key not in self._clients:
             self._clients[cache_key] = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
@@ -48,7 +56,26 @@ class LegalRewriter:
 
     def set_model(self, model):
         """Change the model and update the client."""
-        self.model = model
+        # Do not allow switching away from the enforced snapshot.
+        if model != getattr(self, "_ENFORCED_MODEL", "gpt-5-2025-08-07"):
+            raise ValueError(f"Only the model '{self._ENFORCED_MODEL}' is supported.")
+        self.model = self._ENFORCED_MODEL
+
+    def set_system_prompt(self, prompt: str):
+        """Allow updating the system prompt at runtime.
+        The prompt parameter is treated as the editable "tail" that appears
+        after the hidden vocabulary. The full system prompt sent to the model
+        will be the hidden vocabulary + this ui prompt.
+        """
+        if not prompt or not prompt.strip():
+            return
+        # Backwards-compatible: treat as setting the single UI prompt
+        self.set_ui_prompt(prompt)
+
+    def get_system_prompt_tail(self) -> str:
+        """Return the current editable system prompt tail (no vocabulary)."""
+        # Backwards-compatible alias for get_ui_prompt
+        return getattr(self, "ui_prompt", "")
 
     def _extract_vocab(self, pdf_path):
         text = ""
