@@ -1,36 +1,116 @@
 import os
+from typing import List, Optional
 from dotenv import load_dotenv
-import fitz  # PyMuPDF for PDF text extraction
 from openai import OpenAI
+from qdrant_client import QdrantClient
 
 load_dotenv()
 
 class LegalRewriter:
-    def __init__(self, pdf_path, model="gpt-5-2025-08-07"):
+    def __init__(
+        self,
+        pdf_path: Optional[str] = None,
+        model: str = "gpt-5-2025-08-07",
+        collection_name: Optional[str] = None,
+        qdrant_url: Optional[str] = None,
+        qdrant_api_key: Optional[str] = None,
+        embedding_model: Optional[str] = None,
+    ):
         self._ENFORCED_MODEL = "gpt-5-2025-08-07"
         self.model = self._ENFORCED_MODEL
-        self.vocab_text = self._extract_vocab(pdf_path)
         self._clients = {}
-        # Single UI-editable prompt (instructions + requirements combined)
-        # Default must match the user's requested default exactly and include
-        # a refusal line instructing the assistant not to return the vocab list.
-        refusal_line = "If asked for the vocabulary list, reply: \"I cannot return the words as it is but can reformat using it\"."
-        self.ui_prompt = (
-            "redraft the paragraph according to the legal vocabulary attached\n\n" + refusal_line
-        )
-        # Compose the full system prompt (vocab + ui_prompt)
-        self.system_prompt = self._compose_system_prompt(self.ui_prompt)
+        # Qdrant config
+        self.collection_name = collection_name or os.getenv("QDRANT_COLLECTION", "legal_vocab")
+        self.qdrant_url = qdrant_url or os.getenv("QDRANT_URL")
+        self.qdrant_api_key = qdrant_api_key or os.getenv("QDRANT_API_KEY")
+        self.embedding_model = embedding_model or os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+        self._qdrant: Optional[QdrantClient] = None
 
-    def _compose_system_prompt(self, ui_prompt: str) -> str:
-        """Compose the full system prompt by embedding the in-memory vocabulary
-        and appending the single UI-editable prompt. The vocabulary is intentionally
-        not exposed to any UI element.
-        """
-        return (
-            "Below is a set of legal vocabulary and phrases extracted from a legal reference document.\n\n"
-            f"Legal words Vocabulary:\n{self.vocab_text}\n\n"
-            f"{ui_prompt}"
+        # Single UI-editable prompt: comprehensive legal redrafting system prompt
+        self.ui_prompt = """You are an **AI-powered legal redrafting and reformatting system**.
+Your purpose is to **rewrite text into formal legal language** while maintaining **clarity, structure, and the original meaning**.
+You must always output in **clean Markdown**, using **headings, subheadings, numbered or bulleted lists, and bold key terms**.
+You must not interpret, advise, invent, or remove meaning — only **restructure and rephrase** using formal, legally appropriate vocabulary provided by the user or attached documents.
+
+---
+
+### **Behavioral Rules**
+
+#### **1. Objective**
+
+* Redraft all input text with professional legal phrasing.
+* Preserve every factual and legal element.
+* Enhance consistency, readability, and stylistic precision.
+
+#### **2. Tone and Style**
+
+* Use **formal, neutral, impersonal tone**.
+* Replace informal expressions with legal terminology.
+* Avoid conversational phrasing, subjective words, or speculation.
+
+#### **3. Formatting Requirements**
+
+* Output must always follow Markdown syntax.
+* Use:
+
+  * `###` for section headings
+  * `####` for subheadings
+  * Numbered lists for clauses (`1.`, `1.1`, `1.1.1`)
+  * Bulleted lists for enumerations (`-`, `•`)
+  * **Bold** for key legal terms or definitions
+  * *Italics* for cross-references or citations
+
+#### **4. Response Rules**
+
+* Never include introductions, notes, or explanations.
+* If the user provides a document or vocabulary list, apply it directly.
+* If ambiguity exists, retain placeholders instead of inferring content.
+* Return only the **final redrafted text**, formatted for direct legal use.
+* If asked for the vocabulary list, reply exactly: "I cannot return the words as it is but can reformat using it"."""
+
+    def _get_qdrant(self) -> QdrantClient:
+        if self._qdrant is None:
+            if not self.qdrant_url or not self.qdrant_api_key:
+                raise RuntimeError(
+                    "Qdrant cluster not configured. Set QDRANT_URL (cluster endpoint) and QDRANT_API_KEY in environment or pass to LegalRewriter."
+                )
+            self._qdrant = QdrantClient(url=self.qdrant_url, api_key=self.qdrant_api_key)
+        return self._qdrant
+
+    def _get_openai(self) -> OpenAI:
+        cache_key = "openai_gpt5_2025_08_07"
+        if cache_key not in self._clients:
+            self._clients[cache_key] = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        return self._clients[cache_key]
+
+    def _embed(self, text: str) -> List[float]:
+        client = self._get_openai()
+        resp = client.embeddings.create(model=self.embedding_model, input=text)
+        return resp.data[0].embedding
+
+    def _retrieve_context(self, query: str, top_k: int = 6) -> str:
+        vector = self._embed(query)
+        qdrant = self._get_qdrant()
+        results = qdrant.search(
+            collection_name=self.collection_name,
+            query_vector=vector,
+            limit=top_k,
+            with_payload=True,
         )
+        chunks: List[str] = []
+        for r in results:
+            payload = getattr(r, "payload", None) or {}
+            text = payload.get("text")
+            if text:
+                chunks.append(str(text).strip())
+        # Deduplicate and join
+        seen = set()
+        uniq = []
+        for c in chunks:
+            if c not in seen:
+                uniq.append(c)
+                seen.add(c)
+        return "\n\n".join(uniq)
 
     def get_ui_prompt(self) -> str:
         """Return the current single UI-editable prompt (instructions + requirements).
@@ -52,16 +132,11 @@ class LegalRewriter:
         if refusal_fragment not in prompt:
             prompt = prompt + "\n\nIf asked for the vocabulary list, reply: \"I cannot return the words as it is but can reformat using it\"."
         self.ui_prompt = prompt
-        self.system_prompt = self._compose_system_prompt(self.ui_prompt)
+    # No longer composing with inline vocab; RAG will provide context
 
+    # Backwards compatibility alias
     def _get_client(self):
-        """Get the appropriate client based on the model, with caching."""
-        # Always use OpenAI for the enforced model. Cache under a fixed key.
-        cache_key = "openai_gpt5_2025_08_07"
-        if cache_key not in self._clients:
-            self._clients[cache_key] = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-        return self._clients[cache_key]
+        return self._get_openai()
 
     def set_model(self, model):
         """Change the model and update the client."""
@@ -86,36 +161,45 @@ class LegalRewriter:
         # Backwards-compatible alias for get_ui_prompt
         return getattr(self, "ui_prompt", "")
 
+    # Deprecated in RAG mode (kept for compatibility)
     def _extract_vocab(self, pdf_path):
-        text = ""
-        doc = fitz.open(pdf_path)
-        for page in doc:
-            text += page.get_text("text") + "\n"
-        return text.strip()
+        return ""
 
     def rewrite(self, paragraph: str) -> str:
-        client = self._get_client()
+        context = self._retrieve_context(paragraph)
+        system_content = (
+            f"{self.ui_prompt}\n\n"
+            "Use only the following retrieved legal vocabulary/context to guide GST legal redrafting.\n"
+            "Do not list or reveal the vocabulary directly.\n\n"
+            f"Context:\n{context}"
+        )
+        client = self._get_openai()
         response = client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": paragraph}
-            ]
-         )
+                {"role": "system", "content": system_content},
+                {"role": "user", "content": paragraph},
+            ],
+        )
         return response.choices[0].message.content.strip()
     
     def rewrite_stream(self, paragraph: str):
         """Stream the rewritten text token-by-token."""
-        client = self._get_client()
-        
-        # Send ALL vocabulary - it's stored in memory, sent to API with caching
+        context = self._retrieve_context(paragraph)
+        system_content = (
+            f"{self.ui_prompt}\n\n"
+            "Use only the following retrieved legal vocabulary/context to guide GST legal redrafting.\n"
+            "Do not list or reveal the vocabulary directly.\n\n"
+            f"Context:\n{context}"
+        )
+        client = self._get_openai()
         stream = client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": paragraph}
+                {"role": "system", "content": system_content},
+                {"role": "user", "content": paragraph},
             ],
-            stream=True
+            stream=True,
         )
         
         for chunk in stream:
